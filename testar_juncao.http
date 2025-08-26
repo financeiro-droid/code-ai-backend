@@ -1,0 +1,9 @@
+POST http://127.0.0.1:8000/criar-juncao
+Content-Type: application/json
+
+{
+  "tipo": "Auto",
+  "administradora": "Caixa Consórcios",
+  "valor_desejado": 40000,
+  "entrada_maxima_percentual": 45
+}
