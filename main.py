@@ -7,9 +7,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Sua função de junção existente (mantemos)
-from planilha_processor import criar_juncao_sob_demanda
-
 # Dependências para ler o GCS (inventário de cartas)
 try:
     import pandas as pd
@@ -146,5 +143,48 @@ def get_cartas(prefix: Optional[str] = None):
 def criar_juncao(req: RequisicaoJuncao):
     """
     Usa sua função existente para montar as junções (sem expor fornecedores).
+    Lazy import garante que o app sobe mesmo sem o módulo.
     """
     try:
+        # Lazy import aqui ↓↓↓
+        from planilha_processor import criar_juncao_sob_demanda as _criar
+    except Exception as e:
+        return {
+            "erro": "backend_not_ready",
+            "detalhe": f"Falha ao carregar motor de junção (planilha_processor): {e}"
+        }
+
+    try:
+        resultado = _criar(
+            tipo=req.tipo,
+            credito_desejado=req.credito_desejado,
+            entrada_max=req.entrada_max,
+            comissao_extra=req.comissao_extra,
+        )
+        return resultado
+    except Exception as e:
+        return {"erro": str(e)}
+
+# -------------- DIAGNÓSTICO: /diag --------------
+@app.get("/diag")
+def diag():
+    """
+    Diagnóstico: confere leitura do bucket e mostra colunas detectadas.
+    """
+    try:
+        if not HAS_GCS_DEPS:
+            return {"ok": False, "error": "Dependências ausentes (pandas/google-cloud-storage)."}
+        bucket = os.getenv("GCS_BUCKET","planilhas-codecalc")
+        pref = os.getenv("GCS_PREFIX","")
+        raw = _read_all_sheets(bucket, pref)
+        if raw is None or raw.empty:
+            return {"ok": True, "bucket": bucket, "prefix": pref, "rows_detected": 0, "columns": []}
+        return {
+            "ok": True,
+            "bucket": bucket,
+            "prefix": pref,
+            "rows_detected": len(raw),
+            "columns": list(raw.columns)[:20],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
