@@ -194,4 +194,122 @@ def criar_juncao(req: RequisicaoJuncao):
         )
 
     try:
-        # lazy import — app s
+        # lazy import — app sobe mesmo sem o módulo
+        from planilha_processor import criar_juncao_sob_demanda as _criar
+        resultado = _criar(
+            tipo=req.tipo,
+            credito_desejado=req.credito_desejado,
+            entrada_max=req.entrada_max,
+            comissao_extra=req.comissao_extra,  # 0.00 a 0.10 (por ex.)
+            prefix=req.prefix,
+            return_private=False
+        )
+        return resultado
+    except Exception as e:
+        return {"erro": str(e)}
+
+# -------------- LEAD: /lead (envia detalhes ao time CoDE) --------------
+@app.post("/lead")
+def receber_lead(payload: LeadPayload):
+    """
+    Recebe dados do formulário após o parceiro escolher a opção.
+    Recalcula com retorno privado e envia DETALHES INTERNOS ao Slack (ADMIN_WEBHOOK).
+    """
+    admin_webhook = os.getenv("ADMIN_WEBHOOK", "")
+
+    # Recalcular opções (com private=True) e localizar a escolhida pelo solution_id
+    escolhida: Dict[str, Any] = None
+    try:
+        from planilha_processor import criar_juncao_sob_demanda as _criar
+        resultado = _criar(
+            tipo=payload.selecao.tipo,
+            credito_desejado=payload.selecao.credito_desejado,
+            entrada_max=payload.selecao.entrada_max,
+            comissao_extra=payload.selecao.comissao_extra,
+            prefix=payload.selecao.prefix,
+            return_private=True
+        )
+        opcoes = resultado.get("opcoes", [])
+        escolhida = next((o for o in opcoes if o.get("solution_id") == payload.selecao.solution_id), None)
+    except Exception:
+        escolhida = None
+
+    # Montar mensagem para o time CoDE (INTERNAL ONLY)
+    txt = [
+        "*[NOVO LEAD CoDE]*",
+        f"*Nome:* {payload.nome}",
+        f"*WhatsApp:* {payload.whatsapp}",
+        f"*E-mail:* {payload.email}",
+        f"*Cidade/UF:* {payload.cidade_uf or '-'}",
+        f"*Horário preferido:* {payload.melhor_horario or '-'}",
+        f"*Origem:* {payload.origem or '-'}",
+        "",
+        "*Solicitação:*",
+        f"- Tipo: {payload.selecao.tipo}",
+        f"- Crédito desejado: R$ {payload.selecao.credito_desejado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+        f"- Comissão variável: {payload.selecao.comissao_extra*100:.2f}% (fixo plataforma: 5%)",
+    ]
+    if escolhida:
+        pol = f"{(0.05+payload.selecao.comissao_extra)*100:.2f}%"
+        txt += [
+            "",
+            "*Junção selecionada:*",
+            f"- solution_id: {escolhida.get('solution_id')}",
+            f"- Administradora/Tipo: {escolhida.get('administradora')} / {escolhida.get('tipo')}",
+            f"- Crédito total: R$ {escolhida.get('credito_total'):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+            f"- Entrada (c/ comissão total {pol}): R$ {escolhida.get('entrada'):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+            f"- Cartas usadas: {escolhida.get('cartas_usadas')}",
+            f"- Parcelas: {escolhida.get('parcelas')}",
+        ]
+        priv = escolhida.get("private", {})
+        fornecedores = priv.get("fornecedores", [])
+        blobs = priv.get("blobs", [])
+        creditos = priv.get("creditos_individuais", [])
+        parcelas = priv.get("parcelas_individuais", [])
+        vencs = priv.get("vencimentos", [])
+        if creditos:
+            txt.append("")
+            txt.append("*Cartas (detalhe interno/confidencial):*")
+            for i in range(len(creditos)):
+                linha = (
+                    f"  • Fornecedor: {fornecedores[i] or '-'} | "
+                    f"Crédito: R$ {creditos[i]:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                    + f" | Venc.: {vencs[i] or '-'} | Fonte: {blobs[i]}"
+                )
+                if i < len(parcelas) and parcelas[i]:
+                    linha += f" | Parcelas: {parcelas[i]}"
+                txt.append(linha)
+
+    # Disparo Slack (não bloqueante)
+    if admin_webhook:
+        try:
+            requests.post(admin_webhook, json={"text": "\n".join(txt)}, timeout=10)
+        except Exception:
+            pass
+
+    # Resposta para o front (sem dados sensíveis)
+    return {"ok": True, "message": "Recebemos seus dados. Um consultor CoDE entrará em contato."}
+
+# -------------- DIAGNÓSTICO: /diag --------------
+@app.get("/diag")
+def diag():
+    """
+    Diagnóstico: confere leitura do bucket e mostra colunas detectadas.
+    """
+    try:
+        if not HAS_GCS_DEPS:
+            return {"ok": False, "error": "Dependências ausentes (pandas/google-cloud-storage)."}
+        bucket = os.getenv("GCS_BUCKET","planilhas-codecalc")
+        pref = os.getenv("GCS_PREFIX","")
+        raw = _read_all_sheets(bucket, pref)
+        if raw is None or raw.empty:
+            return {"ok": True, "bucket": bucket, "prefix": pref, "rows_detected": 0, "columns": []}
+        return {
+            "ok": True,
+            "bucket": bucket,
+            "prefix": pref,
+            "rows_detected": len(raw),
+            "columns": list(raw.columns)[:20],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
