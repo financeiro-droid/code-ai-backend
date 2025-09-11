@@ -3,8 +3,11 @@ import os, io, json, math, hashlib
 from typing import Optional, List, Tuple, Dict, Any
 import pandas as pd
 from google.cloud import storage
+from itertools import combinations
 
-# ---------- Infra ----------
+# =========================
+# Infra GCS
+# =========================
 def _build_client():
     creds = json.loads(os.getenv("GCP_SERVICE_ACCOUNT_JSON"))
     return storage.Client.from_service_account_info(creds)
@@ -20,7 +23,9 @@ def _read_all_sheets(bucket, prefix=""):
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-# ---------- Normalização ----------
+# =========================
+# Normalização
+# =========================
 def _money_to_float(s):
     if s is None: return 0.0
     v = str(s).replace("R$", "").replace(".", "").replace(",", ".").strip()
@@ -43,7 +48,7 @@ def _uid_row(r: pd.Series) -> str:
         str(r.get("fornecedor","")).strip(),
         str(r.get("fonte","")).strip(),
     ])
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()  # id estável sem expor dados no front
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 def _normalizar(df: pd.DataFrame):
     if df is None or df.empty: return df
@@ -71,11 +76,12 @@ def _normalizar(df: pd.DataFrame):
     out["administradora"] = out["administradora"].astype(str).str.strip()
     out["tipo"]           = out["tipo"].astype(str).str.strip()
 
-    # gera uid estável por linha (nunca exposto como dados sensíveis; só hash no front)
-    out["uid"] = out.apply(_uid_row, axis=1)
+    out["uid"] = out.apply(_uid_row, axis=1)  # id estável (nunca expõe dado sensível)
     return out
 
-# ---------- Utils ----------
+# =========================
+# Utils
+# =========================
 def _sumario_parcelas(lst: List[str]) -> str:
     items = [p for p in lst if isinstance(p, str) and p.strip()]
     return " | ".join(items[:6]) + (" ..." if len(items) > 6 else "")
@@ -101,7 +107,6 @@ def _build_public_option(subset: pd.DataFrame, taxa_total: float) -> Dict[str, A
     }
 
 def _build_private(subset: pd.DataFrame) -> Dict[str, Any]:
-    # pacote apenas para backoffice (nunca vai ao front)
     return {
         "uids": subset["uid"].tolist(),
         "fornecedores": [str(x) for x in subset["fornecedor"].tolist()],
@@ -113,8 +118,9 @@ def _build_private(subset: pd.DataFrame) -> Dict[str, Any]:
         ],
     }
 
-# ---------- Solvers (minimize sum >= target; sem teto de cartas) ----------
-from itertools import combinations
+# =========================
+# Solvers (minimize sum >= target; sem teto de cartas)
+# =========================
 def _mitm_min_cover(values: List[Tuple[float, int]], target: float) -> Tuple[float, List[int]]:
     n = len(values); m = n // 2
     left, right = values[:m], values[m:]
@@ -146,7 +152,8 @@ def _mitm_min_cover(values: List[Tuple[float, int]], target: float) -> Tuple[flo
                 best_sum, best_idxs = s, iL + R[j][1]
     return best_sum, best_idxs
 
-def _fptas_min_cover(values: List[Tuple[float, int]], target: float, eps: float = None, max_states: int = None) -> Tuple[float, List[int]]:
+def _fptas_min_cover(values: List[Tuple[float, int]], target: float,
+                     eps: float = None, max_states: int = None) -> Tuple[float, List[int]]:
     eps = eps or float(os.getenv("CODE_FPTAS_EPS", "0.01"))
     max_states = max_states or int(os.getenv("CODE_FPTAS_MAX", "5000"))
 
@@ -159,7 +166,6 @@ def _fptas_min_cover(values: List[Tuple[float, int]], target: float, eps: float 
         added.sort(key=lambda x: x[0])
 
         while i < len(states_sorted) or j < len(added):
-            cand = None
             if j >= len(added) or (i < len(states_sorted) and states_sorted[i][0] <= added[j][0]):
                 cand = states_sorted[i]; i += 1
             else:
@@ -189,7 +195,9 @@ def _fptas_min_cover(values: List[Tuple[float, int]], target: float, eps: float 
 def _min_cover(values: List[Tuple[float, int]], target: float) -> Tuple[float, List[int]]:
     return _mitm_min_cover(values, target) if len(values) <= 26 else _fptas_min_cover(values, target)
 
-# ---------- API ----------
+# =========================
+# API principal
+# =========================
 def criar_juncao_sob_demanda(tipo: Optional[str],
                              credito_desejado: float,
                              entrada_max: Optional[float] = 0.47,
@@ -198,10 +206,10 @@ def criar_juncao_sob_demanda(tipo: Optional[str],
                              return_private: bool = False) -> Dict[str, Any]:
     """
     Combina cartas (mesma administradora/tipo) sem teto de quantidade.
-    NÃO aplica 2% automaticamente; usa a comissão informada pelo usuário.
+    NÃO aplica 2% automático; usa a comissão informada pelo usuário.
     Aplica SEMPRE 5% da plataforma.
     """
-    taxa_total = 0.05 + float(comissao_extra or 0.0)  # 5% fixo + comissão do usuário (se 0, tudo bem)
+    taxa_total = 0.05 + float(comissao_extra or 0.0)  # 5% fixo + comissão do usuário
 
     bucket = os.getenv("GCS_BUCKET", "planilhas-codecalc")
     pref = prefix or os.getenv("GCS_PREFIX", "")
@@ -219,13 +227,15 @@ def criar_juncao_sob_demanda(tipo: Optional[str],
     opcoes: List[Dict[str, Any]] = []
     for (_, _), grp in df.groupby(["administradora", "tipo"], dropna=False):
         values = [(float(v or 0.0), int(i)) for i, v in enumerate(grp["credito"].tolist()) if float(v or 0.0) > 0]
-        if not values: continue
+        if not values:
+            continue
 
         best_sum, idxs_local = _min_cover(values, float(credito_desejado or 0.0))
         subset = grp.iloc[idxs_local]
 
         entrada = best_sum * taxa_total
         if (entrada_max is not None) and (entrada > best_sum * float(entrada_max)):
+            # sem solução que respeite teto de entrada nesse grupo
             continue
 
         pub = _build_public_option(subset, taxa_total)
