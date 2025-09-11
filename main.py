@@ -22,13 +22,16 @@ except Exception:
 app = FastAPI(title="CoDE.AI Backend")
 
 # ---------------- CORS ----------------
-origins = os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://contempladadescomplicada.com.br,https://www.contempladadescomplicada.com.br"
-).split(",")
+# Libera acesso ao frontend do CoDE no WordPress
+origins = [
+    "https://contempladadescomplicada.com.br",
+    "https://www.contempladadescomplicada.com.br",
+    "http://localhost",  # útil para testes locais
+    "https://code-ai-backend-rcye.onrender.com"  # libera chamadas entre backend e frontend
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in origins if o.strip()],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,9 +46,8 @@ class RequisicaoJuncao(BaseModel):
     tipo: str
     credito_desejado: float
     entrada_max: Optional[float] = 0.47
-    # comissão variável DEVE vir do usuário; se None, pedimos confirmação (HTTP 400)
     comissao_extra: Optional[float] = None
-    prefix: Optional[str] = None  # opcional, caso um dia use prefixo
+    prefix: Optional[str] = None
 
 class Selecao(BaseModel):
     solution_id: str
@@ -139,9 +141,6 @@ def health():
 # -------------- INVENTÁRIO: /cartas --------------
 @app.get("/cartas")
 def get_cartas(prefix: Optional[str] = None):
-    """
-    Retorna o inventário cru do bucket (sem junção, sem expor fornecedores).
-    """
     if _is_updating():
         return {"cartas": [], "info": "Base em atualização. Tente novamente em instantes."}
     try:
@@ -172,12 +171,6 @@ def get_cartas(prefix: Optional[str] = None):
 # -------------- JUNÇÃO: /criar-juncao --------------
 @app.post("/criar-juncao")
 def criar_juncao(req: RequisicaoJuncao):
-    """
-    Usa o motor para montar as junções (mesma administradora/tipo, sem teto de cartas).
-    Regras:
-      - 5% da plataforma SEMPRE aplicados.
-      - comissão extra DEVE vir do usuário (se None, retorna 400 sugerindo 2%).
-    """
     if _is_updating():
         return {"erro": "manutencao", "detalhe": "Base em atualização. Tente novamente em instantes."}
 
@@ -194,13 +187,12 @@ def criar_juncao(req: RequisicaoJuncao):
         )
 
     try:
-        # lazy import — app sobe mesmo sem o módulo
         from planilha_processor import criar_juncao_sob_demanda as _criar
         resultado = _criar(
             tipo=req.tipo,
             credito_desejado=req.credito_desejado,
             entrada_max=req.entrada_max,
-            comissao_extra=req.comissao_extra,  # 0.00 a 0.10 (por ex.)
+            comissao_extra=req.comissao_extra,
             prefix=req.prefix,
             return_private=False
         )
@@ -208,16 +200,10 @@ def criar_juncao(req: RequisicaoJuncao):
     except Exception as e:
         return {"erro": str(e)}
 
-# -------------- LEAD: /lead (envia detalhes ao time CoDE) --------------
+# -------------- LEAD: /lead --------------
 @app.post("/lead")
 def receber_lead(payload: LeadPayload):
-    """
-    Recebe dados do formulário após o parceiro escolher a opção.
-    Recalcula com retorno privado e envia DETALHES INTERNOS ao Slack (ADMIN_WEBHOOK).
-    """
     admin_webhook = os.getenv("ADMIN_WEBHOOK", "")
-
-    # Recalcular opções (com private=True) e localizar a escolhida pelo solution_id
     escolhida: Dict[str, Any] = None
     try:
         from planilha_processor import criar_juncao_sob_demanda as _criar
@@ -234,7 +220,6 @@ def receber_lead(payload: LeadPayload):
     except Exception:
         escolhida = None
 
-    # Montar mensagem para o time CoDE (INTERNAL ONLY)
     txt = [
         "*[NOVO LEAD CoDE]*",
         f"*Nome:* {payload.nome}",
@@ -280,22 +265,17 @@ def receber_lead(payload: LeadPayload):
                     linha += f" | Parcelas: {parcelas[i]}"
                 txt.append(linha)
 
-    # Disparo Slack (não bloqueante)
     if admin_webhook:
         try:
             requests.post(admin_webhook, json={"text": "\n".join(txt)}, timeout=10)
         except Exception:
             pass
 
-    # Resposta para o front (sem dados sensíveis)
     return {"ok": True, "message": "Recebemos seus dados. Um consultor CoDE entrará em contato."}
 
 # -------------- DIAGNÓSTICO: /diag --------------
 @app.get("/diag")
 def diag():
-    """
-    Diagnóstico: confere leitura do bucket e mostra colunas detectadas.
-    """
     try:
         if not HAS_GCS_DEPS:
             return {"ok": False, "error": "Dependências ausentes (pandas/google-cloud-storage)."}
